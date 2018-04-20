@@ -29,7 +29,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdio.h>
-#include <zlib.h>
+#include <zlib/zlib.h>
 #include <stdlib.h>
 
 #include <uuid/uuid.h>

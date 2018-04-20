@@ -29,14 +29,14 @@
 #ifdef USE_ICONV
 #include <iconv.h>
 #else
-#include <uchar.h>
+#include "uchar.h"
 typedef void *iconv_t;
 #endif
 #include <stdbool.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
-#include <zlib.h>
+#include <zlib/zlib.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <linux/fs.h>

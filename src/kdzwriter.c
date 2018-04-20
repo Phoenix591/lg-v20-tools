@@ -32,11 +32,14 @@
 #include <ctype.h>
 #include <termios.h>
 
-#include <selinux/selinux.h>
+#include <selinux/libselinux/include/selinux/selinux.h>
 #include <dlfcn.h>
 
 #include "kdz.h"
 #include "md5.h"
+
+#include <errno.h>
+#include <string.h>
 
 
 int verbose=0;

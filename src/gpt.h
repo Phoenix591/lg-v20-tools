@@ -31,11 +31,7 @@
 
 #include <stdint.h>
 #include <uuid/uuid.h>
-#ifdef ANDROID
 typedef unsigned short char16_t;
-#else
-#include <uchar.h>
-#endif
 
 #include <stdbool.h>
 

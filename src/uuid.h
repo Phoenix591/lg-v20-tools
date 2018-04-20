@@ -19,7 +19,7 @@
 
 #ifndef _UUID_H_
 #define _UUID_H_
-
+#include <string.h>
 typedef char uuid_t[16];
 
 static inline int uuid_is_null(const uuid_t uu)
