@@ -30,7 +30,7 @@
 #endif
 
 #include <stdint.h>
-#include <uuid/uuid.h>
+#include <uuid.h>
 typedef unsigned short char16_t;
 
 #include <stdbool.h>

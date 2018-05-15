@@ -32,7 +32,7 @@
 #include <zlib/zlib.h>
 #include <stdlib.h>
 
-#include <uuid/uuid.h>
+#include <uuid.h>
 
 #include "kdz.h"
 #include "md5.h"
