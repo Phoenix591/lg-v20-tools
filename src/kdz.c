@@ -1,5 +1,5 @@
 /* **********************************************************************
-* Copyright (C) 2017-2018 Elliott Mitchell				*
+* Copyright (C) 2017-2019 Elliott Mitchell				*
 *									*
 *	This program is free software: you can redistribute it and/or	*
 *	modify it under the terms of the GNU General Public License as	*
@@ -369,8 +369,8 @@ int test_kdzfile(struct kdz_file *kdz)
 			{"msadp",		0x2}, /* worthwhile??? */
 			{"pmic",		0x2},
 			{"pmicbak",		0x2},
-			{"raw_resources",	0x2}, /* required, mod cand */
-			{"raw_resourcesbak",	0x3}, /* required */
+/*			{"raw_resources",	0x2}, ** mod candidate */
+			{"raw_resourcesbak",	0x2},
 			{"rpm",			0x2},
 			{"rpmbak",		0x2},
 			{"sec",			0x3}, /* required */
@@ -396,7 +396,11 @@ int test_kdzfile(struct kdz_file *kdz)
 		}
 
 		/* going for a lower-quality match */
-		if(!(maxreturn&matches[mid].result)) continue;
+		if(!(maxreturn&matches[mid].result)) {
+			if(verbose>4) fprintf(stderr,
+"DEBUG: Skipping check of \"%s\", match level too low\n", slice_name);
+			continue;
+		}
 
 
 		if(dz->device!=dev) {
@@ -434,12 +438,18 @@ memcmp(map+dz->target_addr*blksz+cur, buf, cmp)) mismatch=1;
 		if(!unpackchunk_free(ctx, false)) goto abort;
 
 		/* exact match, nothing to worry about */
-		if(!mismatch) continue;
+		if(!mismatch) {
+			if(verbose>4) fprintf(stderr,
+"DEBUG: \"%s\" matched perfectly\n", slice_name);
+			continue;
+		}
 
 
 		/* nuke some maxreturn bits, unless special-case match */
 		if(matches[mid].result<4) {
 			maxreturn&=~matches[mid].result;
+			if(verbose>4) fprintf(stderr,
+"DEBUG: Matching \"%s\" failed, new maxreturn=%d\n", slice_name, maxreturn);
 			continue;
 		}
 
@@ -515,17 +525,22 @@ gpt_type==GPT_PRIMARY?"primary":"backup", 'a'+dev);
 
 
 
-		/* check header fields, okay for the CRCs to differ */
+		/* check header fields, okay for the CRCs to differ
+		** Standard requires reserving space for 128 entries, whether
+		** or not that many are actually initialized.  As such the
+		** count can be legitimately increased. */
 		if(memcmp(&gptdev->head, &gptkdz->head,
 (char *)&gptdev->head.headerCRC32-(char *)&gptdev->head.magic)||
 memcmp(&gptdev->head.reserved, &gptkdz->head.reserved,
 (char *)&gptdev->head.altLBA-(char *)&gptdev->head.reserved)||
 memcmp(&gptdev->head.dataStartLBA, &gptkdz->head.dataStartLBA,
-(char *)&gptdev->head.entryCRC32-(char *)&gptdev->head.dataStartLBA))
+(char *)&gptdev->head.entryStart-(char *)&gptdev->head.dataStartLBA))
 			maxreturn=0; /* fail */
-		/* a device was encountered with the backup GPT's altLBA
-		** pointing at itself, rather than the primary GPT; this is
-		** apparently okay, but violates specifications... */
+		/* Extremely careful reading of the specification is needed.
+		** The Alternate LBA field is supposed to point to the LBA of
+		** the alternate GPT, whether or not the primary is being
+		** examined.  This is easy to misunderstand as the Alternate
+		** LBA pointing at the /other/ GPT. */
 		if(gptdev->head.altLBA!=gptkdz->head.altLBA&&
 gptkdz->head.altLBA!=1&&gptdev->head.altLBA!=gptkdz->head.myLBA)
 			maxreturn=0;
@@ -538,6 +553,11 @@ gptkdz->entry+ii, gptdev->entry+ii);
 		free(gptdev);
 		free(gptkdz);
 
+		if(verbose>4) {
+			if(maxreturn>0) fprintf(stderr,
+"DEBUG: GPT matched sufficiently to remain candidate\n");
+			else fprintf(stderr, "DEBUG: GPT matching failed\n");
+		}
 
 	notfound:
 		/* basically a continue for this loop */
@@ -699,7 +719,40 @@ abort:
 }
 
 
-bool fix_gpts(const struct kdz_file *kdz, const bool simulate)
+static bool fix_gpt_persistent(struct gpt_data *dst,
+struct gpt_buf *const gptdev, unsigned short target, unsigned short index,
+const uint32_t blksz);
+static bool add_fix_gpt_entry(struct gpt_data *dst,
+struct gpt_buf *const unused0, unsigned short target, unsigned short index,
+const uint32_t unused1);
+
+
+static const struct {
+	const char *const name;
+	bool (*func)(struct gpt_data *gptkdz, struct gpt_buf *const gptdevbuf,
+unsigned short target, unsigned short index, const uint32_t blksz);
+	unsigned order; /* where we want to put it, 0==NOP */
+} gpt_targets[]={
+	{ "OP",		add_fix_gpt_entry,	2 },
+	{ "cache",	add_fix_gpt_entry,	5 },
+	{ "cust",	add_fix_gpt_entry,	3 },
+	{ "persistent",	fix_gpt_persistent,	0 },
+	{ "system",	add_fix_gpt_entry,	4 },
+	{ "userdata",	add_fix_gpt_entry,	1 },
+};
+
+static int gpt_index[sizeof(gpt_targets)/sizeof(gpt_targets[0])];
+
+static int finish_gpt_normal(struct gpt_data *gpt);
+
+static int finish_gpt_reverse(struct gpt_data *gpt);
+
+static int get_target(const char *const key);
+
+static long long get_OP_size(void);
+
+bool fix_gpts(const struct kdz_file *kdz, const bool alt_order,
+const bool simulate)
 {
 	int i, j;
 	int dev=-1;
@@ -707,66 +760,12 @@ bool fix_gpts(const struct kdz_file *kdz, const bool simulate)
 	size_t bufsz=4096;
 	char *buf=NULL;
 	struct gpt_data *gptkdz=NULL;
-	int fd;
-	unsigned long long opsz;
+	long long opsz;
 	bool ret=true;
 
+	if((opsz=get_OP_size())<0) return false;
+
 	if(!(buf=malloc(bufsz))) return false;
-
-	if(access("/dev/block/bootdevice/by-name/cust", F_OK)<0) {
-		fprintf(stderr,
-"Cannot access /dev/block/bootdevice/by-name, assuming OP size of 0.\n");
-		opsz=0;
-	} else {
-		if(mkdir("/cust", 0777)<0) {
-			struct stat buf;
-			if(errno!=EEXIST) {
-				fprintf(stderr,
-"Failed to create /cust mount point: %s\n", strerror(errno));
-				goto abort;
-			}
-			if(stat("/cust", &buf)<0||!S_ISDIR(buf.st_mode)) {
-				fprintf(stderr,
-"Failed when creating /cust mount point, unable to continue\n");
-				goto abort;
-			}
-			/* this could mean we were run recently... */
-			umount("/cust");
-		}
-
-		if(mount("/dev/block/bootdevice/by-name/cust", "/cust",
-"ext4", MS_RDONLY, "discard")) {
-			fprintf(stderr,
-"Failed OP resize data retrieval: %s\n", strerror(errno));
-			goto abort;
-		}
-
-		if((fd=open("/cust/official_op_resize.cfg",
-O_RDONLY|MS_NOATIME))<0) {
-			fprintf(stderr,
-"Unable to open official_op_resize.cfg: %s\n", strerror(errno));
-			umount("/cust");
-			goto abort;
-		}
-
-		if(read(fd, buf, bufsz)<0) {
-			fprintf(stderr,
-"Failed during read of official_op_resize.cfg: %s\n", strerror(errno));
-			opsz=0;
-		} else {
-			buf[bufsz-1]='\0';
-
-			i=strchr(buf, '=')-buf+1;
-
-			opsz=strtoull(buf+i, NULL, 0);
-		}
-
-		if(verbose>=1) fprintf(stderr,
-"official_op_resize.cfg makes /OP %llu bytes\n", opsz);
-
-		close(fd);
-		umount("/cust");
-	}
 
 
 	for(i=1; i<=kdz->dz_file.chunk_count; ++i) {
@@ -774,9 +773,13 @@ O_RDONLY|MS_NOATIME))<0) {
 		uint32_t blksz;
 		struct gpt_buf gpt_buf;
 
+		unsigned touched=0; /* flag modified GPTs */
+
 		if(strcmp(dz->slice_name, "PrimaryGPT")) continue;
 
 		if((dev=open_device(kdz, dz->device, O_RDWR))<0) goto abort;
+
+		memset(gpt_index, -1, sizeof(gpt_index));
 
 		blksz=kdz->devs[dz->device].blksz;
 
@@ -805,73 +808,23 @@ O_RDONLY|MS_NOATIME))<0) {
 			goto abort;
 		}
 
+		gpt_buf.bufsz=kdz->devs[dz->device].len;
+		gpt_buf.buf=kdz->devs[dz->device].map;
+
+
+		/* Search phase */
 
 		for(j=0; j<gptkdz->head.entryCount; ++j) {
-			int64_t delta;
-			uint32_t start, end;
-			struct gpt_entry *const kdzentr=gptkdz->entry+j;
+			int mat;
 
-			if(!strcmp("persistent", kdzentr->name)) {
-				struct gpt_data *gptdev=NULL;
-
-				gpt_buf.bufsz=kdz->devs[dz->device].len;
-				gpt_buf.buf=kdz->devs[dz->device].map;
-				gptdev=readgptb(gptbuffunc, &gpt_buf, blksz,
-GPT_ANY);
-
-				if(gptdev&&!uuid_is_null(gptdev->entry[j].id))
-					uuid_copy(kdzentr->id, gptdev->entry[j].id);
-
-				else {
-					int urandom;
-					urandom=open("/dev/urandom", O_RDONLY);
-
-					/* I'm guessing this is appropriate */
-					/* if this fails, well can't do much */
-					if(urandom>=0) {
-						read(urandom, &kdzentr->id, sizeof(kdzentr->id));
-						close(urandom);
-					}
-				}
-
-				if(gptdev) free(gptdev);
-			}
-
-			if(strcmp("OP", kdzentr->name)) continue;
-
-			/* convert to block count */
-			delta=opsz/blksz;
-
-			/* oddly OP in KDZ files is non-zero size */
-			delta-=(kdzentr->endLBA-kdzentr->startLBA+1);
-
-			start=end=j;
-			if(!strcmp("userdata", gptkdz->entry[j-1].name)) {
-				if(verbose>=7) fprintf(stderr,
-"DEBUG: userdata before OP, userdata end=%lu, OP begin=%lu\n",
-gptkdz->entry[j-1].endLBA, kdzentr->startLBA);
-				if(gptkdz->entry[j-1].endLBA+1!=kdzentr->startLBA) continue;
-				--end;
-				delta=-delta;
-			} else if(!strcmp("userdata", gptkdz->entry[j+1].name)) {
-				if(verbose>=7) fprintf(stderr,
-"DEBUG: OP before userdata, userdata begin=%lu, OP end=%lu\n",
-gptkdz->entry[j+1].startLBA, kdzentr->endLBA);
-				if(gptkdz->entry[j+1].startLBA!=kdzentr->endLBA+1) continue;
-				++start;
-			} else continue;
-			if(verbose>=4) fprintf(stderr,
-"DEBUG: OP: start idx %u end idx %u, delta=%+ld\n", start, end, delta);
-			gptkdz->entry[start].startLBA+=delta;
-			gptkdz->entry[end].endLBA+=delta;
-			if(verbose>=4) fprintf(stderr,
-"DEBUG: OP: new start %lu, new end %lu\n", gptkdz->entry[start].startLBA,
-gptkdz->entry[end].endLBA);
-
-			/* Yes, they ARE this perverse; adjust userdata first */
-			if(opsz<=0)
-				memset(kdzentr, 0, sizeof(struct gpt_entry));
+			if((mat=get_target(gptkdz->entry[j].name))>=0)
+				if(gpt_targets[mat].func(gptkdz, &gpt_buf, mat,
+j, blksz)) touched=1;
 		}
+
+		if(touched&&
+!(alt_order?finish_gpt_reverse:finish_gpt_normal)(gptkdz))
+			return false;
 
 		if(!simulate) {
 			if(!writegpt(dev, gptkdz)) {
@@ -913,6 +866,307 @@ abort:
 	return false;
 }
 
+static bool fix_gpt_persistent(struct gpt_data *gptkdz,
+struct gpt_buf *const gptdevbuf, unsigned short target, unsigned short index,
+const uint32_t blksz)
+{
+	struct gpt_data *gptdev=NULL;
+	struct gpt_entry *const kdzentr=gptkdz->entry+index;
+
+	gptdev=readgptb(gptbuffunc, gptdevbuf, blksz, GPT_ANY);
+
+	if(gptdev&&!uuid_is_null(gptdev->entry[index].id))
+		uuid_copy(kdzentr->id, gptdev->entry[index].id);
+
+	else {
+		int urandom;
+		urandom=open("/dev/urandom", O_RDONLY);
+
+		/* I'm guessing this is appropriate */
+		/* if this fails, well can't do much */
+		if(urandom>=0) {
+			read(urandom, &kdzentr->id, sizeof(kdzentr->id));
+			close(urandom);
+		}
+	}
+
+	if(gptdev) free(gptdev);
+
+	return false;
+}
+
+
+static int finish_gpt_normal(struct gpt_data *gpt)
+{
+	int64_t delta;
+	long long opsz;
+
+	struct gpt_entry *opentr, *datentr, *startentr, *endentr;
+
+	int i;
+
+
+	i=get_target("OP");
+	if(verbose>=7) fprintf(stderr, "DEBUG: OP: target=%d ", i);
+	if((i=gpt_index[i])<0) return true;
+	if(verbose>=7) fprintf(stderr, "index=%d name=\"%s\"\n", i,
+gpt->entry[i].name);
+	opentr=gpt->entry+i;
+
+	i=get_target("userdata");
+	if(verbose>=7) fprintf(stderr, "DEBUG: userdata: target=%d ", i);
+	if((i=gpt_index[i])<0) {
+		fprintf(stderr, "Error: userdata and OP on different major "
+"devices, cannot compensate!\n");
+		return true;
+	}
+	if(verbose>=7) fprintf(stderr, "index=%d name=\"%s\"\n", i,
+gpt->entry[i].name);
+	datentr=gpt->entry+i;
+
+
+
+
+	if((opsz=get_OP_size())<0) return false;
+
+	/* convert to block count */
+	delta=opsz/gpt->blocksz;
+
+	/* oddly OP in KDZ files is non-zero size */
+	delta-=(opentr->endLBA-opentr->startLBA+1);
+
+
+	if(datentr->startLBA<opentr->startLBA) {
+		if(verbose>=7) fprintf(stderr,
+"DEBUG: userdata before OP, userdata %lu-%lu, OP %lu-%lu\n",
+datentr->startLBA, datentr->endLBA, opentr->startLBA, opentr->endLBA);
+		if(datentr->endLBA+1!=opentr->startLBA) {
+			fprintf(stderr, "Error: userdata is non-contiguous "
+"with OP, unable to adjust\n");
+			return true;
+		}
+		startentr=opentr;
+		endentr=datentr;
+		delta=-delta;
+	} else if(datentr->startLBA>opentr->endLBA) {
+		if(verbose>=7) fprintf(stderr,
+"DEBUG: OP before userdata, OP %lu-%lu, userdata %lu-%lu\n",
+opentr->startLBA, opentr->endLBA, datentr->startLBA, datentr->endLBA);
+		if(datentr->startLBA!=opentr->endLBA+1) {
+			fprintf(stderr, "Error: userdata is non-contiguous "
+"with OP, unable to adjust\n");
+			return true;
+		}
+		startentr=datentr;
+		endentr=opentr;
+	} else {
+		fprintf(stderr, "Error: userdata and OP overlap???  Removing "
+"OP entry!\n");
+		memset(opentr, 0, sizeof(struct gpt_entry));
+		return true;
+	}
+	if(verbose>=4) fprintf(stderr,
+"DEBUG: OP: old start idx %lu old end idx %lu, delta=%+ld\n",
+startentr->startLBA, endentr->endLBA, delta);
+	startentr->startLBA+=delta;
+	endentr->endLBA+=delta;
+	if(verbose>=4) fprintf(stderr,
+"DEBUG: OP: new start %lu, new end %lu\n", startentr->startLBA,
+endentr->endLBA);
+
+	/* Yes, they ARE this perverse; adjust userdata first */
+	if(opsz<=0)
+		memset(opentr, 0, sizeof(struct gpt_entry));
+
+	return 1;
+}
+
+static struct gpt_entry *gptsort;
+static int _finish_gpt_reverse_sort_cur(const void *a, const void *b);
+static int _finish_gpt_reverse_sort_ord(const void *a, const void *b);
+static int finish_gpt_reverse(struct gpt_data *gpt)
+{
+	int ordered[sizeof(gpt_targets)/sizeof(gpt_targets[0])];
+	int i, lo, hi, cnt=0;
+
+	for(i=0; i<sizeof(gpt_targets)/sizeof(gpt_targets[0]); ++i)
+		if(~gpt_index[i]&&gpt_targets[i].order) ordered[cnt++]=i;
+
+	if(verbose>=7) {
+		fprintf(stderr, "DEBUG: %s: ordered", __func__);
+		for(i=0; i<cnt; ++i) fprintf(stderr, " %d", ordered[i]);
+		putc('\n', stderr);
+	}
+
+	if(cnt<=1) {
+		char out[40];
+		uuid_unparse(gpt->head.diskUuid, out);
+
+		if(verbose>=7) fprintf(stderr, "DEBUG: Skipping dev %s, %d "
+"notable\n", out, cnt);
+		return 1; /* not much we can do here */
+	}
+
+	if(verbose>=4) {
+		char out[40];
+		uuid_unparse(gpt->head.diskUuid, out);
+		fprintf(stderr, "DEBUG: Going to do %s, %d can be reordered\n",
+out, cnt);
+	}
+
+	gptsort=gpt->entry;
+	qsort(ordered, cnt, sizeof(int), _finish_gpt_reverse_sort_cur);
+
+	if(verbose>=7) {
+		fprintf(stderr, "DEBUG: %s: LBA sorted entries:\n", __func__);
+		for(i=0; i<cnt; ++i)
+			fprintf(stderr, "DEBUG: %s: start=%lu end=%lu\n",
+gpt->entry[gpt_index[ordered[i]]].name,
+gpt->entry[gpt_index[ordered[i]]].startLBA,
+gpt->entry[gpt_index[ordered[i]]].endLBA);
+	}
+
+	lo=0;
+	while(cnt-lo>=2) {
+		uint64_t base=gpt->entry[gpt_index[ordered[lo]]].startLBA;
+		hi=lo;
+		while(++hi<cnt)
+			if(gpt->entry[gpt_index[ordered[hi-1]]].endLBA+1!=
+gpt->entry[gpt_index[ordered[hi]]].startLBA) break;
+		if(hi-lo<2) {
+			if(verbose>=7) fprintf(stderr, "DEBUG: %s: Skipping "
+"reordering group of %d slices\n", __func__, hi-lo);
+			lo=hi;
+			continue;
+		}
+		if(verbose>=7) fprintf(stderr, "DEBUG: %s: Reordering group "
+"of %d slices\n", __func__, hi-lo);
+		qsort(ordered+lo, hi-lo, sizeof(int),
+_finish_gpt_reverse_sort_ord);
+		do {
+			struct gpt_entry *const entr=gpt->entry+gpt_index[ordered[lo]];
+			entr->endLBA-=entr->startLBA;
+			entr->startLBA=base;
+			base+=entr->endLBA+1;
+			entr->endLBA=base-1;
+			if(verbose>=7) fprintf(stderr, "DEBUG: %s: "
+"new entry for \"%s\" start=%lu end=%lu\n", __func__, entr->name,
+entr->startLBA, entr->endLBA);
+		} while(++lo<hi);
+	}
+
+	/* this is needed to deal with adjusting the size of OP */
+	finish_gpt_normal(gpt);
+
+	return 1;
+}
+static int _finish_gpt_reverse_sort_cur(const void *a, const void *b)
+{
+	return gptsort[gpt_index[*(int *)a]].startLBA-gptsort[gpt_index[*(int *)b]].startLBA;
+}
+static int _finish_gpt_reverse_sort_ord(const void *a, const void *b)
+{
+	return gpt_targets[*(int *)a].order-gpt_targets[*(int *)b].order;
+}
+
+
+static bool add_fix_gpt_entry(struct gpt_data *dst,
+struct gpt_buf *const unused0, unsigned short target, unsigned short index,
+const uint32_t unused1)
+{
+	if(verbose>=7) fprintf(stderr, "DEBUG: %s: target=%hu index=%hu, "
+"entry name=\"%s\"\n", __func__, target, index, dst->entry[index].name);
+	gpt_index[target]=index;
+	return true;
+}
+
+
+static int get_target(const char *const key)
+{
+	unsigned char lo=0, hi=sizeof(gpt_targets)/sizeof(gpt_targets[0]);
+	int res, mid;
+
+	while(mid=(hi+lo)/2, res=strcmp(key, gpt_targets[mid].name)) {
+		if(res<0) hi=mid;
+		else if(res>0) lo=mid+1;
+		if(lo==hi) return -1;
+	}
+	return mid;
+}
+
+
+static long long get_OP_size(void)
+{
+	int i;
+	size_t bufsz=4096;
+	char *buf=NULL;
+	int fd;
+	unsigned long long opsz=-1;
+
+	if(access("/dev/block/bootdevice/by-name/cust", F_OK)<0) {
+		fprintf(stderr,
+"Cannot access /dev/block/bootdevice/by-name/cust, assuming OP size of 0.\n");
+		return 0;
+	}
+
+	if(mkdir("/cust", 0777)<0) {
+		struct stat buf;
+		if(errno!=EEXIST) {
+			fprintf(stderr,
+"Failed to create /cust mount point: %s\n", strerror(errno));
+			goto end;
+		}
+		if(stat("/cust", &buf)<0||!S_ISDIR(buf.st_mode)) {
+			fprintf(stderr,
+"Failed when creating /cust mount point, unable to continue\n");
+			goto end;
+		}
+		/* this could mean we were run recently... */
+		umount("/cust");
+	}
+
+	if(mount("/dev/block/bootdevice/by-name/cust", "/cust",
+"ext4", MS_RDONLY, "discard")) {
+		fprintf(stderr,
+"Failed OP resize data retrieval: %s\n", strerror(errno));
+		goto end;
+	}
+
+	if((fd=open("/cust/official_op_resize.cfg",
+O_RDONLY|MS_NOATIME))<0) {
+		fprintf(stderr,
+"Unable to open official_op_resize.cfg: %s\n", strerror(errno));
+		umount("/cust");
+		goto end;
+	}
+
+	if(!(buf=malloc(bufsz))) goto end;
+
+	if(read(fd, buf, bufsz)<0) {
+		fprintf(stderr,
+"Failed during read of official_op_resize.cfg: %s\n", strerror(errno));
+		opsz=0;
+	} else {
+		buf[bufsz-1]='\0';
+
+		i=strchr(buf, '=')-buf+1;
+
+		opsz=strtoull(buf+i, NULL, 0);
+	}
+
+	if(verbose>=1) fprintf(stderr,
+"official_op_resize.cfg makes /OP %lld bytes\n", opsz);
+
+	close(fd);
+	umount("/cust");
+
+
+end:
+	if(buf) free(buf);
+
+	return opsz;
+}
+
 
 int write_kdzfile(const struct kdz_file *const kdz,
 const char *const slice_name, const bool simulate)
@@ -929,35 +1183,77 @@ const char *const slice_name, const bool simulate)
 	short wrote=0, skip=0;
 
 	for(i=1; i<=kdz->dz_file.chunk_count; ++i) {
-		struct gpt_data *gptdev;
-		struct gpt_buf gpt_buf;
-
 		/* not the one */
 		if(strcmp(slice_name, kdz->chunks[i].dz.slice_name)) continue;
 
 		dev=kdz->chunks[i].dz.device;
+	}
 
-		gpt_buf.bufsz=kdz->devs[dev].len;
-		gpt_buf.buf=kdz->devs[dev].map;
+	/* Unfortunately we MUST compare with the GPT found in the KDZ file.
+	** If the device's GPT has been modified, the offsets found on the
+	** device GPT will differ from what the KDZ file has.  */
+	for(i=1; i<=kdz->dz_file.chunk_count; ++i) {
+		struct gpt_data *gptkdz;
+		struct gpt_buf gpt_buf;
+
+		struct unpackctx _ctx={0,}, *const ctx=&_ctx;
+
+		if(strcmp("PrimaryGPT", kdz->chunks[i].dz.slice_name)) continue;
+		if(kdz->chunks[i].dz.device!=dev) continue;
+
 
 		blksz=kdz->devs[dev].blksz;
 
-		if(!(gptdev=readgptb(gptbuffunc, &gpt_buf, blksz, GPT_ANY))) {
-			fprintf(stderr, "Failed to read GPT from /dev/block/sd%c\n", 'a'+dev);
+		gpt_buf.bufsz=(1<<14)+(blksz<<2); /* 16K for entries, +2 blk */
+		if(!(gpt_buf.buf=malloc(gpt_buf.bufsz))) {
+			fprintf(stderr, "Memory allocation failure when "
+"examining KDZ GPT\n");
 			return 0;
 		}
 
-		for(j=0; j<gptdev->head.entryCount-1; ++j) {
-			/* not the one */
-			if(strcmp(slice_name, gptdev->entry[j].name)) continue;
+                if(!unpackchunk_alloc(ctx, kdz, i)) {
+			fprintf(stderr, "Failed initializing decompression "
+"when examining KDZ GPT\n");
+			free(gpt_buf.buf);
+			return 0;
+		}
 
-			startLBA=gptdev->entry[j].startLBA;
+
+		if(unpackchunk(ctx, gpt_buf.buf, gpt_buf.bufsz)<=0) {
+			fprintf(stderr, "Failed during decompression when "
+"examining KDZ GPT\n");
+			free(gpt_buf.buf);
+			return 0;
+		}
+
+
+		if(!unpackchunk_free(ctx, true)) {
+			fprintf(stderr, "Failed cleanup after decompressing "
+"KDZ GPT\n");
+			free(gpt_buf.buf);
+			return 0;
+		}
+
+
+		if(!(gptkdz=readgptb(gptbuffunc, &gpt_buf, blksz, GPT_ANY))) {
+			fprintf(stderr, "Failed to load GPT from KDZ file\n");
+			free(gpt_buf.buf);
+			return 0;
+		}
+
+		free(gpt_buf.buf);
+
+		for(j=0; j<gptkdz->head.entryCount-1; ++j) {
+			/* not the one */
+			if(strcmp(slice_name, gptkdz->entry[j].name)) continue;
+
+			startLBA=gptkdz->entry[j].startLBA;
 			offset=startLBA*blksz;
 
 			break;
 		}
 
-		free(gptdev);
+		free(gptkdz);
 		/* fail */
 		if(!startLBA) return 0;
 		break;
@@ -1221,10 +1517,10 @@ ctx->zstr.total_in, ctx->zstr.total_out);
 		return -1;
 	}
 
-	(*pMD5_Update)(&ctx->md5, buf, bufsz);
-	ctx->crc=crc32(ctx->crc, (Bytef *)buf, bufsz);
+	(*pMD5_Update)(&ctx->md5, buf, bufsz-ctx->zstr.avail_out);
+	ctx->crc=crc32(ctx->crc, (Bytef *)buf, bufsz-ctx->zstr.avail_out);
 
-	return bufsz;
+	return bufsz-ctx->zstr.avail_out;
 }
 
 
